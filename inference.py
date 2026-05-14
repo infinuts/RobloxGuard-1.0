@@ -10,6 +10,7 @@ import argparse
 import time
 import re
 import os
+import sys
 import csv
 from datetime import datetime
 from pathlib import Path
@@ -717,4 +718,4 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
