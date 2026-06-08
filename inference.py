@@ -9,7 +9,6 @@ import torch
 import argparse
 import time
 import re
-import os
 import sys
 import csv
 from datetime import datetime
@@ -19,7 +18,51 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 import models
 import datasets
-import random
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+HF_URL_PREFIX = "https://huggingface.co/"
+
+
+def resolve_existing_path(path_value: str, config_dir: Optional[Path] = None) -> Path:
+    """Resolve a file path from common project/config-relative locations."""
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+
+    candidates = [PROJECT_ROOT / path]
+    if config_dir is not None:
+        candidates.append(config_dir / path)
+    candidates.append(Path.cwd() / path)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    return candidates[0].resolve()
+
+
+def resolve_output_path(path_value: str) -> Path:
+    """Resolve output paths relative to the project root for reproducible runs."""
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
+def resolve_model_path(model_path: str, config_dir: Optional[Path] = None) -> str:
+    """Resolve local model paths while preserving Hugging Face model references."""
+    if model_path.startswith(HF_URL_PREFIX):
+        return model_path
+
+    resolved_path = resolve_existing_path(model_path, config_dir)
+    if resolved_path.exists():
+        return str(resolved_path)
+
+    if "/" in model_path:
+        return model_path
+
+    return str(resolved_path)
 
 
 def pick_dtype() -> torch.dtype:
@@ -71,11 +114,11 @@ class ModelEvaluator:
             kwargs["device_map"] = "auto"
         
         # Check if model_path is a Hugging Face model ID or local path
-        if self.model_path.startswith("https://huggingface.co/"):
+        if self.model_path.startswith(HF_URL_PREFIX):
             # Extract model ID from URL
-            model_id = self.model_path.replace("https://huggingface.co/", "")
+            model_id = self.model_path.replace(HF_URL_PREFIX, "")
             is_hf_model = True
-        elif "/" in self.model_path and not os.path.exists(self.model_path):
+        elif "/" in self.model_path and not Path(self.model_path).expanduser().exists():
             # Assume it's a Hugging Face model ID (e.g., "Roblox/RobloxGuard")
             model_id = self.model_path
             is_hf_model = True
@@ -96,10 +139,11 @@ class ModelEvaluator:
             
         else:
             # Original local model loading logic
-            output_path = self.model_path
-            adapter_path = os.getcwd() + "/" + output_path
+            adapter_path = Path(self.model_path).expanduser()
+            if not adapter_path.is_absolute():
+                adapter_path = (Path.cwd() / adapter_path).resolve()
             
-            if not os.path.exists(adapter_path):
+            if not adapter_path.exists():
                 raise FileNotFoundError(f"Adapter path not found: {adapter_path}")
             
             # Load tokenizer with left padding for causal LMs
@@ -111,19 +155,19 @@ class ModelEvaluator:
             self.model = AutoModelForCausalLM.from_pretrained(self.base_model, **kwargs)
             
             # Load adapter
-            self.model = PeftModel.from_pretrained(self.model, adapter_path)
+            self.model = PeftModel.from_pretrained(self.model, str(adapter_path))
         
         self.model.eval()
         print(f"Model loaded successfully with dtype: {dtype}")
     
-    def generate_text(self, prompt: str, max_length: Optional[int] = None, temperature: float = 0.2) -> str:
+    def generate_text(self, prompt: str, max_length: Optional[int] = None, temperature: float = 0.0) -> str:
         """Generate text using the loaded model.
         
         Args:
             prompt: Input prompt text
             max_length: Maximum number of tokens to generate
-            temperature: Sampling temperature. Default is 0.2 for better accuracy.
-                        Set to 0.0 for deterministic (greedy) decoding.
+            temperature: Sampling temperature. Default is 0.0 for deterministic
+                        benchmark and production regression runs.
         """
         if max_length is None:
             max_length = self.max_output_tokens
@@ -220,11 +264,22 @@ class EvaluationMetrics:
 class SafetyEvaluator:
     """Main class for running safety evaluations."""
     
-    def __init__(self, model_evaluator: ModelEvaluator, output_file: str, has_labels: bool = True):
+    def __init__(
+        self,
+        model_evaluator: ModelEvaluator,
+        output_file: str,
+        has_labels: bool = True,
+        config_dir: Optional[Path] = None,
+        generation_temperature: float = 0.0,
+        verbose: bool = False,
+    ):
         self.model_evaluator = model_evaluator
         self.metrics = EvaluationMetrics()
         self.output_file = output_file
         self.has_labels = has_labels
+        self.config_dir = config_dir
+        self.generation_temperature = generation_temperature
+        self.verbose = verbose
         self.csv_writer = None
         self.csv_file = None
     
@@ -235,18 +290,61 @@ class SafetyEvaluator:
         return prompt_template.format(prompt=prompt, response=response)
     
     def extract_llm_output(self, llm_output: str, field_name: str) -> str:
-        """Extract the target field from LLM output using regex."""
+        """Extract a target field from JSON-like model output."""
+        output = llm_output.strip()
+
         try:
-            pattern = rf'"{field_name}"\s*:\s*"?(\w+)"?,?'
-            match = re.search(pattern, llm_output)
-            
-            if match:
-                result = match.group(1)
-                return result
-            else:
-                return ""
-        except Exception as e:
+            parsed = json.loads(output)
+            value = parsed.get(field_name)
+            if value is not None:
+                return self.normalize_label(value)
+        except json.JSONDecodeError:
+            pass
+
+        json_match = re.search(r"\{.*\}", output, flags=re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+                value = parsed.get(field_name)
+                if value is not None:
+                    return self.normalize_label(value)
+            except json.JSONDecodeError:
+                pass
+
+        pattern = rf'"{re.escape(field_name)}"\s*:\s*("([^"]*)"|true|false|null|[A-Za-z0-9_-]+)'
+        match = re.search(pattern, output, flags=re.IGNORECASE)
+        if match:
+            return self.normalize_label(match.group(2) if match.group(2) is not None else match.group(1))
+
+        return ""
+
+    @staticmethod
+    def normalize_label(value: Any) -> str:
+        """Normalize booleans and strings into comparable label text."""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
             return ""
+        return str(value).strip().strip('"').lower()
+
+    @staticmethod
+    def sanitize_csv_field(value: Any) -> str:
+        """Prevent spreadsheet formula execution when CSVs are opened manually."""
+        text = "" if value is None else str(value)
+        text = text.replace('\n', ' ').replace('\r', '')
+        if text.startswith(("=", "+", "-", "@")):
+            return "'" + text
+        return text
+
+    @staticmethod
+    def is_flagged(value: Any, flagged_value: Any) -> bool:
+        return SafetyEvaluator.normalize_label(value) == SafetyEvaluator.normalize_label(flagged_value)
+
+    def resolve_dataset_file(self, dataset_path: str) -> Path:
+        return resolve_existing_path(dataset_path, self.config_dir)
+
+    def resolve_prompt_file(self, prompt_path: str) -> Path:
+        return resolve_existing_path(prompt_path, self.config_dir)
 
     
     def write_result(self, result_data: Dict[str, Any]) -> None:
@@ -260,8 +358,8 @@ class SafetyEvaluator:
                     current_metrics = result_data.get("current_metrics", {})
                     row = {
                         'index': result_data.get('index'),
-                        'input_prompt': result_data.get('input_prompt', '').replace('\n', ' ').replace('\r', ''),
-                        'input_response': input_response.replace('\n', ' ').replace('\r', ''),
+                        'input_prompt': self.sanitize_csv_field(result_data.get('input_prompt', '')),
+                        'input_response': self.sanitize_csv_field(input_response),
                         'actual_unsafe': result_data.get('actual_unsafe'),
                         'predicted_unsafe': result_data.get('predicted_unsafe'),
                         'correct': result_data.get('correct')
@@ -270,9 +368,9 @@ class SafetyEvaluator:
                     # Simplified output when no labels are available
                     row = {
                         'index': result_data.get('index'),
-                        'input_prompt': result_data.get('input_prompt', '').replace('\n', ' ').replace('\r', ''),
-                        'input_response': input_response.replace('\n', ' ').replace('\r', ''),
-                        'llm_prediction': result_data.get('llm_prediction', '')
+                        'input_prompt': self.sanitize_csv_field(result_data.get('input_prompt', '')),
+                        'input_response': self.sanitize_csv_field(input_response),
+                        'llm_prediction': self.sanitize_csv_field(result_data.get('llm_prediction', ''))
                     }
                 
                 self.csv_writer.writerow(row)
@@ -313,11 +411,8 @@ class SafetyEvaluator:
 
             # Create evaluation dataset in the specified format
             for data in df:
-                # Calculate label based on safety annotations
-                if not data['labels_0'] == 'Safe' and not data['labels_1'] == 'Safe' and not data['labels_2'] == 'Safe':
-                    prompt_label = "unsafe"
-                else:
-                    prompt_label = "safe"
+                unsafe_votes = sum(str(data[label]) != 'Safe' for label in ('labels_0', 'labels_1', 'labels_2'))
+                prompt_label = "unsafe" if unsafe_votes >= 2 else "safe"
 
                 entry = {
                     "prompt": data['text'],
@@ -337,7 +432,7 @@ class SafetyEvaluator:
                 }
                 eval_dataset.append(entry)
         elif eval_config["name"] == models.OPENAI_MOD:
-            with open(eval_config["eval_dataset"], 'r') as f:
+            with open(self.resolve_dataset_file(eval_config["eval_dataset"]), 'r', encoding='utf-8') as f:
                 df = f.readlines()
 
             for data in df:
@@ -410,7 +505,7 @@ class SafetyEvaluator:
                 }
                 eval_dataset.append(entry)
         elif eval_config["name"] == models.HARMBENCH:
-            with open(eval_config["eval_dataset"], 'r') as f:
+            with open(self.resolve_dataset_file(eval_config["eval_dataset"]), 'r', encoding='utf-8') as f:
                 raw_data = json.load(f)
             keys = list(raw_data.keys())
 
@@ -541,7 +636,7 @@ class SafetyEvaluator:
         
         try:
             # Load prompt template
-            with open(eval_config["eval_prompt"], "r", encoding="utf-8") as file:
+            with open(self.resolve_prompt_file(eval_config["eval_prompt"]), "r", encoding="utf-8") as file:
                 prompt_template = file.read().strip()
             
             # Load evaluation dataset
@@ -557,18 +652,18 @@ class SafetyEvaluator:
                 
                 # Format prompt and generate response
                 prompt = self.format_prompt(prompt_template, eval_data)
-                llm_output = self.model_evaluator.generate_text(prompt)
+                llm_output = self.model_evaluator.generate_text(
+                    prompt,
+                    temperature=self.generation_temperature
+                )
 
                 llm_prediction = self.extract_llm_output(
                     llm_output, 
                     eval_config['llm_output_field']
                 )
-                if not llm_prediction:
-                    llm_output = {eval_config["llm_output_field"]: llm_output}
-                    llm_output = json.dumps(llm_output)
-                    print("Converted to json.")
-
-                print("llm_output:", llm_output)
+                if not llm_prediction and self.verbose:
+                    print("Could not parse LLM output field:", eval_config['llm_output_field'])
+                    print("Raw LLM output:", llm_output)
                 
                 # Extract prediction from LLM output
                 llm_prediction = self.extract_llm_output(
@@ -578,12 +673,10 @@ class SafetyEvaluator:
                 if self.has_labels:
                     # Determine ground truth and prediction
                     actual_unsafe = (
-                        str(eval_data.get(eval_label_field_key, "")).lower() == 
-                        str(eval_config["eval_flagged_value"]).lower()
+                        self.is_flagged(eval_data.get(eval_label_field_key, ""), eval_config["eval_flagged_value"])
                     )
                     predicted_unsafe = (
-                        str(eval_config["llm_flagged_value"]).lower() == 
-                        llm_prediction.lower()
+                        self.is_flagged(llm_prediction, eval_config["llm_flagged_value"])
                     )
                     
                     # Update metrics
@@ -599,9 +692,10 @@ class SafetyEvaluator:
                         "correct": predicted_unsafe == actual_unsafe,
                         "current_metrics": self.metrics.get_metrics_dict()
                     }
-                    print(result_data)
-                    print("correct:", predicted_unsafe == actual_unsafe)
-                    print()
+                    if self.verbose:
+                        print(result_data)
+                        print("correct:", predicted_unsafe == actual_unsafe)
+                        print()
                 else:
                     # Prepare simplified result data when no labels
                     result_data = {
@@ -658,8 +752,16 @@ class SafetyEvaluator:
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load evaluation configuration from JSON file."""
-    with open(config_path, 'r', encoding='utf-8') as file:
-        return json.load(file)
+    path = Path(config_path).expanduser()
+    if not path.is_absolute():
+        candidates = [Path.cwd() / path, PROJECT_ROOT / path]
+        path = next((candidate for candidate in candidates if candidate.exists()), candidates[0]).resolve()
+
+    with open(path, 'r', encoding='utf-8') as file:
+        config = json.load(file)
+
+    config["_config_dir"] = str(path.parent)
+    return config
 
 
 def main():
@@ -667,6 +769,10 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate fine-tuned model safety")
     parser.add_argument("--config", required=True, 
                        help="Path to evaluation configuration JSON")
+    parser.add_argument("--temperature", type=float, default=None,
+                       help="Override generation temperature. Defaults to config value or 0.0")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Print raw model outputs and per-example records")
     
     args = parser.parse_args()
     
@@ -677,6 +783,7 @@ def main():
     
     # Load evaluation configuration
     eval_config = load_config(args.config)
+    config_dir = Path(eval_config.pop("_config_dir"))
     
     # Determine output file: command line argument takes precedence over config file
     if "output_file" in eval_config:
@@ -688,6 +795,14 @@ def main():
         # Generate default filename if neither is provided
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = f"output_{timestamp}.csv"
+    output_file = str(resolve_output_path(output_file))
+    generation_temperature = (
+        args.temperature
+        if args.temperature is not None
+        else float(eval_config.get("generation_temperature", 0.0))
+    )
+    if generation_temperature < 0:
+        raise ValueError("Generation temperature must be non-negative")
     
     print(f"Output file: {output_file}")
 
@@ -695,16 +810,20 @@ def main():
     model_evaluator = ModelEvaluator(
         max_output_tokens=eval_config["max_output_tokens"],
         base_model=eval_config["base_model"],
-        model_path=eval_config["model_path"]
+        model_path=resolve_model_path(eval_config["model_path"], config_dir)
     )
     
     # Create a directory
-    output_dir = os.path.dirname(output_file)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
 
     # Run evaluation
-    safety_evaluator = SafetyEvaluator(model_evaluator, output_file)
+    safety_evaluator = SafetyEvaluator(
+        model_evaluator,
+        output_file,
+        config_dir=config_dir,
+        generation_temperature=generation_temperature,
+        verbose=args.verbose or bool(eval_config.get("verbose", False)),
+    )
     safety_evaluator.evaluate_dataset(eval_config)
         
     end_time = time.time()
