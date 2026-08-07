@@ -357,7 +357,6 @@ class SafetyEvaluator:
         elif eval_config["name"] == models.BEAVERTAILS:
             df = datasets.load_dataset(eval_config["eval_dataset"], split='330k_test')
     
-            eval_dataset = []
             for data in df:
                 entry = {
                     "prompt": data['prompt'],
@@ -368,7 +367,6 @@ class SafetyEvaluator:
         elif eval_config["name"] == models.ROGUARD:
             df = datasets.load_dataset(eval_config["eval_dataset"], split='test')
 
-            eval_dataset = []
             for data in df:
                 entry = {
                     "prompt": data['prompt'],
@@ -379,7 +377,6 @@ class SafetyEvaluator:
         elif eval_config["name"] == models.TOXICCHAT:
             df = datasets.load_dataset(eval_config["eval_dataset"], name='toxicchat0124', split='test')
     
-            eval_dataset = []
             for data in df:
                 entry = {
                     "prompt": data['user_input'],
@@ -390,7 +387,6 @@ class SafetyEvaluator:
         elif eval_config["name"] == models.WILDGUARD_PROMPT:
             df = datasets.load_dataset(eval_config["eval_dataset"], name='wildguardtest', split='test')
     
-            eval_dataset = []
             for data in df:
                 entry = {
                     "prompt": data['prompt'],
@@ -498,8 +494,6 @@ class SafetyEvaluator:
                     "is_safe": "unsafe" if data['response_harmfulness'] else "safe"
                 }
                 eval_dataset.append(entry)
-    
-            return eval_dataset
 
         elif eval_config["name"] == models.SIMPLEST:
             df = datasets.load_dataset(eval_config["eval_dataset"], split="test")
