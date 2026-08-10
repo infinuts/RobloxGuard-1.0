@@ -4,7 +4,7 @@
   "model_path": "Roblox/Llama-3.1-8B-Instruct-RobloxGuard-1.0",
   "base_model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
   "max_output_tokens": 100,
-  "generation_temperature": 0.0,
+  "generation_temperature": 0.2,
 
   "eval_prompt": "prompts/openai_mod.txt",
   "llm_output_field": "User Safety",
