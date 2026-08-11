@@ -1,3 +1,4 @@
+# Use Python 3.10-3.13. torch==2.7.1 does not publish Python 3.14 wheels.
 torch==2.7.1
 transformers==4.53.0
 peft==0.15.2

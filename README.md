@@ -117,4 +117,3 @@ If you are using Roblox Guard 1.0, please cite it as:
   journal={arXiv preprint arXiv:2512.05339},
   year={2025}
 }
-
